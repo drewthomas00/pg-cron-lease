@@ -1,0 +1,60 @@
+{
+  "name": "pg-cron-lease",
+  "version": "1.0.0",
+  "description": "Make an in-process cron job a singleton across replicas using the Postgres you already have. One atomic conditional upsert per tick — no advisory locks, no Redis, no coordination service.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "cron",
+    "postgres",
+    "lease",
+    "lock",
+    "singleton",
+    "replicas",
+    "scheduler",
+    "node-cron",
+    "distributed"
+  ],
+  "author": "Drew Thomas <drew@drewthomasbuilds.com> (https://drewthomasbuilds.com)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/drewthomas00/pg-cron-lease.git"
+  },
+  "bugs": {
+    "url": "https://github.com/drewthomas00/pg-cron-lease/issues"
+  },
+  "homepage": "https://github.com/drewthomas00/pg-cron-lease#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "pg": ">=8"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "pg": "^8.11.0"
+  },
+  "dependencies": {}
+}
