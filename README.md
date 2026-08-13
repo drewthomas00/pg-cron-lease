@@ -1,6 +1,10 @@
 # pg-cron-lease
 
+[![npm](https://img.shields.io/npm/v/pg-cron-lease)](https://www.npmjs.com/package/pg-cron-lease)
 [![CI](https://github.com/drewthomas00/pg-cron-lease/actions/workflows/ci.yml/badge.svg)](https://github.com/drewthomas00/pg-cron-lease/actions/workflows/ci.yml)
+[![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](https://www.npmjs.com/package/pg-cron-lease?activeTab=dependencies)
+[![node](https://img.shields.io/node/v/pg-cron-lease)](https://www.npmjs.com/package/pg-cron-lease)
+[![license](https://img.shields.io/npm/l/pg-cron-lease)](LICENSE)
 
 Make an in-process cron job a singleton across replicas, using the Postgres you already have.
 
@@ -134,6 +138,14 @@ DATABASE_URL=postgres://postgres:pg@localhost:5432/postgres npm test
 
 The integration suite is the one that matters — it races ten claimants at a single occurrence and asserts exactly one runs, re-claims an expired lease, proves a failed tick keeps its lease, and pins the transaction-clock behaviour above. CI runs it against Postgres 14 and 18.
 
+## Related packages
+
+Small, dependency-light pieces pulled out of production systems I've built:
+
+- **[tcpa-quiet-hours](https://github.com/drewthomas00/tcpa-quiet-hours)** — is it legal to send this marketing message right now?
+- **[twilio-signature-verify](https://github.com/drewthomas00/twilio-signature-verify)** — verify `X-Twilio-Signature`, including behind a reverse proxy
+- **[us-zip-centroids](https://github.com/drewthomas00/us-zip-centroids)** — offline US ZIP → lat/lng, no geocoder
+
 ## License
 
-MIT
+MIT © [Drew Thomas](https://drewthomasbuilds.com)
