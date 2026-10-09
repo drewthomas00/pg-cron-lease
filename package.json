@@ -1,6 +1,6 @@
 {
   "name": "pg-cron-lease",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Make an in-process cron job a singleton across replicas using the Postgres you already have. One atomic conditional upsert per tick — no advisory locks, no Redis, no coordination service.",
   "main": "index.js",
   "types": "index.d.ts",
