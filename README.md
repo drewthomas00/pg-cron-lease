@@ -118,10 +118,11 @@ This is the right trade for sends, charges, and anything else with external side
 
 - Arguments are validated **before** the lease is claimed. A claim taken and then abandoned to a `TypeError` would hold the lease for its full duration, so a wiring typo would silently disable the job fleet-wide.
 - `jobName` is a free-form string and the primary key. Namespace it (`'billing:hourly-sync'`) so two services can't collide.
-- `holder` defaults to `hostname:pid`, so `SELECT * FROM cron_leases` tells you who last *claimed* each job. It does not tell you whether they finished — after a crash the row looks the same as a healthy one until it expires.
+- `holder` defaults to `hostname:pid`, so `SELECT * FROM cron_leases` tells you who last *claimed* each job. Each claim stores it as `<holder>#<uuid>`: `renew()` fences on that whole value, so an overrunning tick cannot extend a lease that its own process's next fire — or a replica that happens to share its hostname and pid, as containers do — has since re-claimed. The row does not tell you whether the claimant finished — after a crash it looks the same as a healthy one until it expires.
 - `table` (and `createTableSql(table)`) accept a custom or schema-qualified name. A table name can't be a bind parameter, so it's validated as an identifier and quoted.
 - The table holds no application data. It needs no row-level security and no tenant scoping.
-- `pg` is an optional peer dependency — anything with a `.query(sql, params)` resolving to `{rowCount}` or `{rows}` works, including a transaction handle.
+- `pg` is an optional peer dependency — anything with a `.query(sql, params)` resolving to `{rowCount}` or `{rows}` works.
+- **Pass a pool, not an open transaction.** It works — `clock_timestamp()` keeps the comparison honest — but the claim then lives inside your transaction: other replicas' claims *block* on the row lock until you commit instead of skipping straight away, and a rollback erases the claim, so a tick that throws no longer keeps its lease.
 
 ## Testing
 

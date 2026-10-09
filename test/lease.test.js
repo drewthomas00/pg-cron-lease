@@ -76,7 +76,19 @@ describe('withCronLease — winning the lease', () => {
   it('stamps a holder so you can see who claimed the job', async () => {
     const db = fakeDb({ rowCount: 1 });
     await withCronLease(db, 'billing:daily', LEASE.HOURLY, counter(), { holder: 'worker-7' });
-    assert.equal(db.calls[0].params[2], 'worker-7');
+    assert.match(db.calls[0].params[2], /^worker-7#[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+
+  it('names each claim uniquely, so renew fences on the claim and not the process', async () => {
+    // Two claims by one process must not share a holder value, or the older
+    // tick's renew() would extend the newer claim's lease.
+    const db = fakeDb({ rowCount: 1 });
+    const seen = [];
+    const tick = async ({ holder }) => { seen.push(holder); };
+    await withCronLease(db, 'billing:daily', LEASE.HOURLY, tick, { holder: 'worker-7' });
+    await withCronLease(db, 'billing:daily', LEASE.HOURLY, tick, { holder: 'worker-7' });
+    assert.notEqual(seen[0], seen[1]);
+    assert.equal(seen[0], db.calls[0].params[2], 'ctx.holder is what was written');
   });
 
   it('accepts a driver that returns rows but no rowCount', async () => {

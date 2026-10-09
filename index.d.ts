@@ -17,13 +17,17 @@ export interface LeaseContext {
    */
   renew(extendMs?: number): Promise<boolean>;
   jobName: string;
+  /** What this claim wrote to the `holder` column: `<holder>#<uuid>`. */
   holder: string;
   leaseMs: number;
 }
 
 export interface LeaseOptions {
   logger?: { debug?: (message: string) => void };
-  /** Identifies this claimant in the table. Defaults to `hostname:pid`. */
+  /**
+   * Identifies this claimant in the table. Defaults to `hostname:pid`. Each
+   * claim stores it with a `#<uuid>` suffix, which is what `renew` fences on.
+   */
   holder?: string;
   /** Lease table, optionally schema-qualified. Defaults to `cron_leases`. */
   table?: string;

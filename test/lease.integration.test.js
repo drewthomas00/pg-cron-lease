@@ -111,7 +111,7 @@ describe('cross-replica claim (real Postgres)', () => {
     assert.equal(second.ran, true);
 
     const { rows } = await pool.query(`SELECT holder FROM "${TABLE}" WHERE job_name = $1`, [JOB]);
-    assert.equal(rows[0].holder, 'replica-b');
+    assert.match(rows[0].holder, /^replica-b#/);
   });
 
   itDb('a failed tick leaves the lease held, so nobody re-runs it immediately', async () => {
@@ -167,6 +167,21 @@ describe('renew', () => {
     await withCronLease(pool, JOB, 60, async ({ renew }) => {
       await new Promise((r) => setTimeout(r, 150));
       await withCronLease(pool, JOB, LEASE.EVERY_5_MIN, async () => 'stolen', opts('replica-b'));
+      renewed = await renew();
+    }, opts('replica-a'));
+
+    assert.equal(renewed, false);
+  });
+
+  itDb('refuses it even when the re-claim came from the same holder name', async () => {
+    // One process, one hostname:pid — an overrunning tick and that process's
+    // next fire. Fencing on the name alone would let the old tick renew the
+    // new claim and keep running beside it.
+    let renewed = true;
+    await withCronLease(pool, JOB, 60, async ({ renew }) => {
+      await new Promise((r) => setTimeout(r, 150));
+      const next = await withCronLease(pool, JOB, LEASE.EVERY_5_MIN, async () => 'next fire', opts('replica-a'));
+      assert.equal(next.ran, true);
       renewed = await renew();
     }, opts('replica-a'));
 

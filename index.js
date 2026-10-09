@@ -41,6 +41,7 @@
  */
 
 const os = require('node:os');
+const { randomUUID } = require('node:crypto');
 
 /** Unqualified or schema-qualified SQL identifier. */
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_$]*$/;
@@ -186,7 +187,12 @@ async function withCronLease(db, jobName, leaseMs, runTick, opts = {}) {
   }
 
   const target = quoteTable(table);
-  const claimant = holder || DEFAULT_HOLDER;
+  // Unique per CLAIM, not per process. `renew` fences on this value, and a
+  // holder name alone is shared by every claim one process makes: a tick that
+  // overran its lease would otherwise renew the lease its own next fire had
+  // just legitimately re-claimed, and both would run. Replicas can share a
+  // name too — every container is pid 1, and compose often fixes the hostname.
+  const claimant = `${holder || DEFAULT_HOLDER}#${randomUUID()}`;
   const ms = Math.round(leaseMs);
 
   // clock_timestamp(), not NOW(): see the module header. NOW() is frozen at the
@@ -226,7 +232,7 @@ async function withCronLease(db, jobName, leaseMs, runTick, opts = {}) {
    *
    * The `holder` and `lease_until` predicates are what make this safe: a lease
    * that expired and was re-claimed cannot be extended out from under its new
-   * owner.
+   * owner — even one in this same process, since `holder` names the claim.
    */
   const renew = async (extendMs = ms) => {
     const bump = Math.round(extendMs);
