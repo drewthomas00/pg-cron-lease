@@ -5,19 +5,23 @@
 
 /** Anything with a `pg`-shaped query method: a Pool, a Client, a transaction. */
 export interface Queryable {
-  query(sql: string, params?: unknown[]): Promise<{ rowCount?: number; rows?: unknown[] }>;
+  query(sql: string, params?: unknown[]): Promise<{ rowCount?: number | null; rows?: unknown[] }>;
 }
 
 export interface LeaseContext {
   /**
-   * Extend this holder's lease. Resolves false when we no longer hold it —
-   * meaning another replica has claimed the job and may be running it.
+   * Set this claim's lease to expire `extendMs` from now. Resolves false when
+   * we no longer hold it — meaning another replica has claimed the job and may
+   * be running it. Renew by what the next piece of work needs: the lease is
+   * never released early, so anything renewed past the end of the tick skips
+   * the next fire.
    *
    * @param extendMs how far past now to push the expiry; defaults to `leaseMs`
+   * @throws {TypeError} if the driver returned no rows to fence the claim on
    */
   renew(extendMs?: number): Promise<boolean>;
   jobName: string;
-  /** What this claim wrote to the `holder` column: `<holder>#<uuid>`. */
+  /** The holder name this claim wrote to the `holder` column. */
   holder: string;
   leaseMs: number;
 }
@@ -25,20 +29,20 @@ export interface LeaseContext {
 export interface LeaseOptions {
   logger?: { debug?: (message: string) => void };
   /**
-   * Identifies this claimant in the table. Defaults to `hostname:pid`. Each
-   * claim stores it with a `#<uuid>` suffix, which is what `renew` fences on.
+   * Identifies this claimant in the table's `holder` column. Defaults to
+   * `hostname:pid`. Informational only: `renew` fences on the claim itself,
+   * so replicas sharing a name are still told apart.
    */
   holder?: string;
   /** Lease table, optionally schema-qualified. Defaults to `cron_leases`. */
   table?: string;
 }
 
-export interface LeaseOutcome<T> {
-  /** false means another replica holds the lease for this occurrence. */
-  ran: boolean;
-  /** The tick's return value, or null when it was skipped. */
-  result: T | null;
-}
+/**
+ * `ran: true` carries the tick's return value; `ran: false` means another
+ * replica holds the lease for this occurrence and the tick was skipped.
+ */
+export type LeaseOutcome<T> = { ran: true; result: T } | { ran: false; result: null };
 
 /**
  * Run `runTick` only if this process wins the lease for `jobName`.

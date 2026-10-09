@@ -111,7 +111,7 @@ describe('cross-replica claim (real Postgres)', () => {
     assert.equal(second.ran, true);
 
     const { rows } = await pool.query(`SELECT holder FROM "${TABLE}" WHERE job_name = $1`, [JOB]);
-    assert.match(rows[0].holder, /^replica-b#/);
+    assert.equal(rows[0].holder, 'replica-b', 'the plain holder name, readable by whoever is looking');
   });
 
   itDb('a failed tick leaves the lease held, so nobody re-runs it immediately', async () => {
@@ -128,7 +128,7 @@ describe('the clock is the database, not the replica', () => {
   itDb('claims correctly from inside a long-open transaction', async () => {
     // NOW() is transaction_timestamp(). With it, a lease that has genuinely
     // expired reads as still held inside a transaction that has been open a
-    // few seconds, and the occurrence is silently skipped forever.
+    // few seconds, and that occurrence is silently skipped.
     await withCronLease(pool, JOB, 60, async () => 'first', opts('replica-a'));
 
     const client = await pool.connect();

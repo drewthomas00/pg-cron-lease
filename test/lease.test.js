@@ -18,16 +18,21 @@ const {
   withCronLease, LEASE, CRON_LEASES_TABLE_SQL, createTableSql, quoteTable,
 } = require('..');
 
-/** A stand-in `pg` pool that records the SQL it was handed. */
+/**
+ * A stand-in `pg` pool that records the SQL it was handed. Each winning claim
+ * returns a fresh `claim_token`, as the database's `claimed_at` would.
+ */
 function fakeDb({ rowCount = 1, throws = null, result } = {}) {
   const calls = [];
+  let claims = 0;
   return {
     calls,
     async query(sql, params) {
       calls.push({ sql, params });
       if (throws) throw throws;
       if (result !== undefined) return result;
-      return { rowCount, rows: rowCount ? [{ job_name: params[0] }] : [] };
+      claims += 1;
+      return { rowCount, rows: rowCount ? [{ job_name: params[0], claim_token: `17600000000000${claims}` }] : [] };
     },
   };
 }
@@ -73,26 +78,22 @@ describe('withCronLease — winning the lease', () => {
     assert.equal((db.calls[0].sql.match(/clock_timestamp\(\)/g) || []).length, 4);
   });
 
-  it('stamps a holder so you can see who claimed the job', async () => {
+  it('stamps the holder name so you can see who claimed the job', async () => {
     const db = fakeDb({ rowCount: 1 });
-    await withCronLease(db, 'billing:daily', LEASE.HOURLY, counter(), { holder: 'worker-7' });
-    assert.match(db.calls[0].params[2], /^worker-7#[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    const tick = counter();
+    await withCronLease(db, 'billing:daily', LEASE.HOURLY, tick, { holder: 'worker-7' });
+    assert.equal(db.calls[0].params[2], 'worker-7');
+    assert.equal(tick.ctx.holder, 'worker-7', 'ctx.holder is what was written');
   });
 
-  it('names each claim uniquely, so renew fences on the claim and not the process', async () => {
-    // Two claims by one process must not share a holder value, or the older
-    // tick's renew() would extend the newer claim's lease.
+  it('returns the claim\'s timestamp as its fencing token', async () => {
     const db = fakeDb({ rowCount: 1 });
-    const seen = [];
-    const tick = async ({ holder }) => { seen.push(holder); };
-    await withCronLease(db, 'billing:daily', LEASE.HOURLY, tick, { holder: 'worker-7' });
-    await withCronLease(db, 'billing:daily', LEASE.HOURLY, tick, { holder: 'worker-7' });
-    assert.notEqual(seen[0], seen[1]);
-    assert.equal(seen[0], db.calls[0].params[2], 'ctx.holder is what was written');
+    await withCronLease(db, 'billing:daily', LEASE.HOURLY, counter());
+    assert.match(db.calls[0].sql, /RETURNING job_name, \(extract\(epoch FROM claimed_at\) \* 1000000\)::bigint::text AS claim_token/);
   });
 
   it('accepts a driver that returns rows but no rowCount', async () => {
-    const db = fakeDb({ result: { rows: [{ job_name: 'billing:daily' }] } });
+    const db = fakeDb({ result: { rows: [{ job_name: 'billing:daily', claim_token: '1' }] } });
     const out = await withCronLease(db, 'billing:daily', LEASE.HOURLY, counter());
     assert.equal(out.ran, true);
   });
@@ -220,18 +221,47 @@ describe('withCronLease — renew', () => {
 
     assert.equal(renewed, true);
     const { sql, params } = db.calls[1];
-    // Guarded by holder AND expiry, so a lease that was already re-claimed
+    // Guarded by the claim AND expiry, so a lease that was already re-claimed
     // cannot be extended out from under its new owner.
     assert.match(sql, /^\s*UPDATE "cron_leases"/);
-    assert.match(sql, /AND holder = \$3/);
+    assert.match(sql, /AND \(extract\(epoch FROM claimed_at\) \* 1000000\)::bigint::text = \$3/);
     assert.match(sql, /AND lease_until > clock_timestamp\(\)/);
     assert.equal(params[1], LEASE.HOURLY);
+    assert.equal(params[2], '176000000000001', 'renew fences on its own claim\'s token');
+  });
+
+  it('fences each tick on its own claim, never on the holder name', async () => {
+    // Two claims by one process share a holder name; the older tick's renew()
+    // must not be able to extend the newer claim's lease.
+    const db = fakeDb({ rowCount: 1 });
+    const tick = async ({ renew }) => { await renew(); };
+    await withCronLease(db, 'billing:daily', LEASE.HOURLY, tick, { holder: 'worker-7' });
+    await withCronLease(db, 'billing:daily', LEASE.HOURLY, tick, { holder: 'worker-7' });
+    const fences = db.calls.filter((c) => /^\s*UPDATE/.test(c.sql)).map((c) => c.params[2]);
+    assert.equal(fences.length, 2);
+    assert.notEqual(fences[0], fences[1]);
+  });
+
+  it('refuses to renew when the driver returned no rows to fence on', async () => {
+    // A rowCount alone proves the claim won, so the tick runs — but without
+    // the token, renew could extend a claim that is not this tick's.
+    const db = fakeDb({ result: { rowCount: 1 } });
+    let ran = false;
+    await withCronLease(db, 'billing:daily', LEASE.HOURLY, async ({ renew }) => {
+      ran = true;
+      await assert.rejects(renew(), /cannot tell which claim/);
+    });
+    assert.equal(ran, true);
+    assert.equal(db.calls.length, 1, 'no unfenced UPDATE may be issued');
   });
 
   it('reports false when the lease has been taken by someone else', async () => {
     const db = {
       n: 0,
-      async query() { this.n += 1; return { rowCount: this.n === 1 ? 1 : 0, rows: [] }; },
+      async query() {
+        this.n += 1;
+        return this.n === 1 ? { rowCount: 1, rows: [{ claim_token: '1' }] } : { rowCount: 0, rows: [] };
+      },
     };
     let renewed = true;
     await withCronLease(db, 'billing:daily', LEASE.HOURLY, async ({ renew }) => {

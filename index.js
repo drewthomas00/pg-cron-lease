@@ -20,7 +20,7 @@
  * it works, and it is why the SQL uses `clock_timestamp()` rather than `NOW()`:
  * `NOW()` is `transaction_timestamp()`, frozen at the start of the surrounding
  * transaction. Pass a transaction handle that has been open for a few seconds
- * and every comparison is stale — an expired lease reads as held (the
+ * and every comparison is stale — an expired lease reads as held (that
  * occurrence is silently skipped) and a fresh claim expires early (a second
  * replica can claim inside the window you meant to reserve).
  *
@@ -41,7 +41,6 @@
  */
 
 const os = require('node:os');
-const { randomUUID } = require('node:crypto');
 
 /** Unqualified or schema-qualified SQL identifier. */
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_$]*$/;
@@ -131,6 +130,24 @@ function claimWon(res) {
   return null;
 }
 
+/**
+ * The claim's fencing token: `claimed_at` as integer microseconds since the
+ * epoch, rendered by the database so no driver's date parsing can round it.
+ */
+const CLAIM_TOKEN_SQL = '(extract(epoch FROM claimed_at) * 1000000)::bigint::text';
+
+/**
+ * The fencing token a winning claim returned, or null when the driver result
+ * carries no rows to read it from.
+ *
+ * @param {object} res
+ * @returns {string|null}
+ */
+function claimToken(res) {
+  const row = res && Array.isArray(res.rows) ? res.rows[0] : undefined;
+  return row && typeof row.claim_token === 'string' ? row.claim_token : null;
+}
+
 /** Call `logger[level]` if there is one. A partial logger must not break a tick. */
 function log(logger, level, message) {
   if (logger && typeof logger[level] === 'function') logger[level](message);
@@ -147,10 +164,13 @@ function log(logger, level, message) {
  *
  *   await withCronLease(pool, 'billing:hourly', LEASE.HOURLY, async ({ renew }) => {
  *     for (const batch of batches) {
- *       if (!await renew()) throw new Error('lost the lease — another replica has it');
- *       await process(batch);
+ *       if (!await renew(5 * 60 * 1000)) throw new Error('lost the lease — another replica has it');
+ *       await processBatch(batch);
  *     }
  *   });
+ *
+ * Renew by what the next piece of work needs: the lease is never released
+ * early, so anything renewed past the end of the tick skips the next fire.
  *
  * @param {{query: Function}} db - a `pg` Pool or Client
  * @param {string} jobName - unique key for this job, e.g. 'billing:daily-invoice'
@@ -161,7 +181,8 @@ function log(logger, level, message) {
  * @param {{logger?: {debug?: Function}, holder?: string, table?: string}} [opts]
  * @returns {Promise<{ran: boolean, result: any}>} `ran: false` means another
  *   replica holds the lease for this occurrence and the tick was skipped.
- * @throws {TypeError} on a malformed argument, always before the lease is taken
+ * @throws {TypeError} on a malformed argument, always before the lease is
+ *   taken; or when the driver's result says neither way whether the claim won
  */
 async function withCronLease(db, jobName, leaseMs, runTick, opts = {}) {
   const { logger, holder, table = DEFAULT_TABLE } = opts || {};
@@ -187,12 +208,7 @@ async function withCronLease(db, jobName, leaseMs, runTick, opts = {}) {
   }
 
   const target = quoteTable(table);
-  // Unique per CLAIM, not per process. `renew` fences on this value, and a
-  // holder name alone is shared by every claim one process makes: a tick that
-  // overran its lease would otherwise renew the lease its own next fire had
-  // just legitimately re-claimed, and both would run. Replicas can share a
-  // name too — every container is pid 1, and compose often fixes the hostname.
-  const claimant = `${holder || DEFAULT_HOLDER}#${randomUUID()}`;
+  const claimant = holder || DEFAULT_HOLDER;
   const ms = Math.round(leaseMs);
 
   // clock_timestamp(), not NOW(): see the module header. NOW() is frozen at the
@@ -206,7 +222,7 @@ async function withCronLease(db, jobName, leaseMs, runTick, opts = {}) {
            holder = EXCLUDED.holder,
            claimed_at = clock_timestamp()
        WHERE ${target}.lease_until <= clock_timestamp()
-     RETURNING job_name`,
+     RETURNING job_name, ${CLAIM_TOKEN_SQL} AS claim_token`,
     [jobName, ms, claimant],
   );
 
@@ -226,27 +242,44 @@ async function withCronLease(db, jobName, leaseMs, runTick, opts = {}) {
     return { ran: false, result: null };
   }
 
+  // The fence for `renew`. A holder name cannot be one: it is shared by every
+  // claim one process makes, so a tick that overran its lease would renew the
+  // lease its own next fire had just legitimately re-claimed, and both would
+  // run — and replicas can share a name too (every container is pid 1, and
+  // compose often fixes the hostname). Each claim stamps `claimed_at` with the
+  // database clock to the microsecond, so a re-claim always carries a
+  // different token.
+  const token = claimToken(res);
+
   /**
-   * Extend this holder's lease. Returns false if we no longer hold it, which
-   * means another replica has already claimed the job and may be running it.
+   * Set this claim's lease to expire `extendMs` from now. Returns false if we
+   * no longer hold it, which means another replica has already claimed the
+   * job and may be running it.
    *
-   * The `holder` and `lease_until` predicates are what make this safe: a lease
-   * that expired and was re-claimed cannot be extended out from under its new
-   * owner — even one in this same process, since `holder` names the claim.
+   * The `claimed_at` and `lease_until` predicates are what make this safe: a
+   * lease that expired and was re-claimed cannot be extended out from under its
+   * new owner — even one in this same process.
    */
   const renew = async (extendMs = ms) => {
     const bump = Math.round(extendMs);
     if (!Number.isFinite(bump) || bump <= 0) {
       throw new TypeError(`renew: extendMs must be a positive number (got ${extendMs})`);
     }
+    if (token === null) {
+      // Renewing without the fence could extend a claim that is not ours.
+      throw new TypeError(
+        'renew: db.query must resolve to { rows } carrying the RETURNING columns '
+        + `— cannot tell which claim on '${jobName}' is this tick's`,
+      );
+    }
     const out = await db.query(
       `UPDATE ${target}
           SET lease_until = clock_timestamp() + ($2::bigint * interval '1 millisecond')
         WHERE job_name = $1
-          AND holder = $3
+          AND ${CLAIM_TOKEN_SQL} = $3
           AND lease_until > clock_timestamp()
       RETURNING job_name`,
-      [jobName, bump, claimant],
+      [jobName, bump, token],
     );
     return claimWon(out) === true;
   };

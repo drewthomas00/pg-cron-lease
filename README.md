@@ -56,7 +56,7 @@ VALUES ($1, clock_timestamp() + …, $3, clock_timestamp())
 ON CONFLICT (job_name) DO UPDATE
   SET lease_until = EXCLUDED.lease_until, …
   WHERE cron_leases.lease_until <= clock_timestamp()
-RETURNING job_name
+RETURNING job_name, …claimed_at AS claim_token
 ```
 
 **The `WHERE` on the `DO UPDATE` is the entire mechanism.** Without it every replica would overwrite the row and all of them would run. With it, the update applies only when the stored lease has already expired — so exactly one claimant gets a row back, and everyone else gets nothing and skips.
@@ -67,7 +67,7 @@ No transaction, no advisory lock, no retry loop. One statement.
 
 That is why this works at all: replicas never compare their own clocks to anything, so skew between machines cannot produce two winners.
 
-It is also why the SQL says `clock_timestamp()` and not `NOW()`. **`NOW()` is `transaction_timestamp()`** — frozen at the start of the surrounding transaction. Pass a transaction handle that has been open for a few seconds and every comparison is stale in both directions: an expired lease reads as still held (the occurrence is silently skipped, forever), and a fresh claim expires early (a second replica can claim inside the window you meant to reserve). It's an easy thing to get wrong and a hard thing to notice.
+It is also why the SQL says `clock_timestamp()` and not `NOW()`. **`NOW()` is `transaction_timestamp()`** — frozen at the start of the surrounding transaction. Pass a transaction handle that has been open for a few seconds and every comparison is stale in both directions: an expired lease reads as still held (that occurrence is silently skipped), and a fresh claim expires early (a second replica can claim inside the window you meant to reserve). It's an easy thing to get wrong and a hard thing to notice.
 
 ### It's a lease, not a lock
 
@@ -92,19 +92,25 @@ This prevents duplicate **claims** per occurrence. It does not, by itself, preve
 Keep the tick well under the lease, or hold your own lease open. `runTick` is called with a context that lets you:
 
 ```js
+const BATCH_BUDGET_MS = 5 * 60 * 1000; // generously more than one batch takes
+
 await withCronLease(pool, 'billing:hourly', LEASE.HOURLY, async ({ renew }) => {
   for (const batch of batches) {
-    if (!await renew()) throw new Error('lost the lease — another replica has it');
-    await process(batch);
+    if (!await renew(BATCH_BUDGET_MS)) throw new Error('lost the lease — another replica has it');
+    await processBatch(batch);
   }
 });
 ```
 
-`renew()` extends the lease only while you still hold it, and resolves **false** once someone else has claimed the job — which is your signal to stop rather than to keep writing.
+`renew(ms)` sets the lease to expire `ms` from now, only while you still hold it, and resolves **false** once someone else has claimed the job — which is your signal to stop rather than to keep writing.
+
+Renew by what the next piece of work needs, not by the whole lease. The lease is never released early, so whatever you renew past the end of your tick is still held when the next fire arrives — and that occurrence is skipped. `renew()` with no argument extends by the full `leaseMs`; on an hourly job that is 50 minutes past the moment you call it.
+
+"You" means this claim, not this process. `renew()` fences on the `claimed_at` its claim returned (the database clock, to the microsecond), so an overrunning tick cannot extend a lease that its own process's next fire has since re-claimed — nor one claimed by a replica that shares its holder name (every container is pid 1, so two with the same fixed hostname do). That fence needs the claim's `RETURNING` row: a driver that reports only `rowCount` can claim, but `renew()` will throw rather than extend a lease it cannot prove is its own.
 
 ## Failure semantics
 
-Both failure paths are chosen on the same principle: **a missed occurrence beats a duplicate.**
+Every failure path is chosen on the same principle: **a missed occurrence beats a duplicate.**
 
 **The claim query throws** (database unreachable) → the error propagates to your handler. Fail loud. The work inside your tick almost certainly needs that same database anyway, so pretending you got the lease helps nobody.
 
@@ -118,10 +124,10 @@ This is the right trade for sends, charges, and anything else with external side
 
 - Arguments are validated **before** the lease is claimed. A claim taken and then abandoned to a `TypeError` would hold the lease for its full duration, so a wiring typo would silently disable the job fleet-wide.
 - `jobName` is a free-form string and the primary key. Namespace it (`'billing:hourly-sync'`) so two services can't collide.
-- `holder` defaults to `hostname:pid`, so `SELECT * FROM cron_leases` tells you who last *claimed* each job. Each claim stores it as `<holder>#<uuid>`: `renew()` fences on that whole value, so an overrunning tick cannot extend a lease that its own process's next fire — or a replica that happens to share its hostname and pid, as containers do — has since re-claimed. The row does not tell you whether the claimant finished — after a crash it looks the same as a healthy one until it expires.
+- `holder` defaults to `hostname:pid`, so `SELECT * FROM cron_leases` tells you who last *claimed* each job, and when. It is informational — nothing fences on it. The row does not tell you whether the claimant finished: after a crash it looks the same as a healthy one until it expires.
 - `table` (and `createTableSql(table)`) accept a custom or schema-qualified name. A table name can't be a bind parameter, so it's validated as an identifier and quoted.
-- The table holds no application data. It needs no row-level security and no tenant scoping.
-- `pg` is an optional peer dependency — anything with a `.query(sql, params)` resolving to `{rowCount}` or `{rows}` works.
+- The table holds only job names, holder names and timestamps — no application data.
+- `pg` is an optional peer dependency — anything with a `.query(sql, params)` resolving to `{rowCount}` or `{rows}` works (`renew()` needs the `rows`).
 - **Pass a pool, not an open transaction.** It works — `clock_timestamp()` keeps the comparison honest — but the claim then lives inside your transaction: other replicas' claims *block* on the row lock until you commit instead of skipping straight away, and a rollback erases the claim, so a tick that throws no longer keeps its lease.
 
 ## Testing
